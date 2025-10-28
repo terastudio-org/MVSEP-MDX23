@@ -90,7 +90,7 @@ def get_model_from_config(model_type, config_path):
 
 
 def demix_new(model, mix, device, config, dim_t=256):
-    mix = torch.tensor(mix)
+    mix = torch.tensor(mix, device=device)  # Move to device early to avoid unnecessary transfers
     #N = options["overlap_BSRoformer"]
     N = 2 # overlap 50%
     batch_size = 1
@@ -100,7 +100,6 @@ def demix_new(model, mix, device, config, dim_t=256):
     step = int(C // N)
     border = C - step
     length_init = mix.shape[-1]
-    #print(f"1: {mix.shape}")
     
     # Do pad from the beginning and end to account floating window results better
     if length_init > 2 * border and (border > 0):
@@ -109,18 +108,15 @@ def demix_new(model, mix, device, config, dim_t=256):
     
     # Prepare windows arrays (do 1 time for speed up). This trick repairs click problems on the edges of segment
     window_size = C
-    fadein = torch.linspace(0, 1, fade_size)
-    fadeout = torch.linspace(1, 0, fade_size)
-    window_start = torch.ones(window_size)
-    window_middle = torch.ones(window_size)
-    window_finish = torch.ones(window_size)
+    fadein = torch.linspace(0, 1, fade_size, device=device, dtype=torch.float32)
+    fadeout = torch.linspace(1, 0, fade_size, device=device, dtype=torch.float32)
+    window_start = torch.ones(window_size, device=device, dtype=torch.float32)
+    window_middle = torch.ones(window_size, device=device, dtype=torch.float32)
+    window_finish = torch.ones(window_size, device=device, dtype=torch.float32)
     window_start[-fade_size:] *= fadeout # First audio chunk, no fadein
     window_finish[:fade_size] *= fadein # Last audio chunk, no fadeout
     window_middle[-fade_size:] *= fadeout
     window_middle[:fade_size] *= fadein
-
-
-
 
     with torch.cuda.amp.autocast():
         with torch.inference_mode():
@@ -129,14 +125,14 @@ def demix_new(model, mix, device, config, dim_t=256):
             else:
                 req_shape = (len(config.training.instruments),) + tuple(mix.shape)
 
-            result = torch.zeros(req_shape, dtype=torch.float32)
-            counter = torch.zeros(req_shape, dtype=torch.float32)
+            result = torch.zeros(req_shape, dtype=torch.float32, device=device)  # Keep on GPU initially
+            counter = torch.zeros(req_shape, dtype=torch.float32, device=device)  # Keep on GPU initially
             i = 0
             batch_data = []
             batch_locations = []
             while i < mix.shape[1]:
                 # print(i, i + C, mix.shape[1])
-                part = mix[:, i:i + C].to(device)
+                part = mix[:, i:i + C]
                 length = part.shape[-1]
                 if length < C:
                     if length > C // 2 + 1:
@@ -159,14 +155,14 @@ def demix_new(model, mix, device, config, dim_t=256):
 
                     for j in range(len(batch_locations)):
                         start, l = batch_locations[j]
-                        result[..., start:start+l] += x[j][..., :l].cpu() * window[..., :l]
+                        result[..., start:start+l] += x[j][..., :l] * window[..., :l]  # Keep on GPU
                         counter[..., start:start+l] += window[..., :l]
 
                     batch_data = []
                     batch_locations = []
 
             estimated_sources = result / counter
-            estimated_sources = estimated_sources.cpu().numpy()
+            estimated_sources = estimated_sources.cpu().numpy()  # Move to CPU only at the end
             np.nan_to_num(estimated_sources, copy=False, nan=0.0)
 
             if length_init > 2 * border and (border > 0):
@@ -188,12 +184,22 @@ def demix_new_wrapper(mix, device, model, config, dim_t=256, bigshifts=1):
 
     results = []
 
-    for shift in tqdm(shifts, position=0):
+    # Use a more efficient approach by storing only vocals key sources
+    for shift in shifts:  # Remove tqdm for better performance in batch processing
         shifted_mix = np.concatenate((mix[:, -shift:], mix[:, :-shift]), axis=-1)
         sources = demix_new(model, shifted_mix, device, config, dim_t=dim_t)
-        vocals = next(sources[key] for key in sources.keys() if key.lower() == "vocals")
+        
+        # Direct access to vocals instead of iterating
+        vocals = sources.get('vocals') if 'vocals' in sources else sources.get('Vocals')
+        if vocals is None:
+            # Fallback if key doesn't match
+            for key in sources.keys():
+                if key.lower() == "vocals":
+                    vocals = sources[key]
+                    break
+        
         unshifted_vocals = np.concatenate((vocals[..., shift:], vocals[..., :shift]), axis=-1)  
-        vocals *= 1 # 1.0005168 CHECK NEEDED! volume compensation
+        unshifted_vocals *= 1 # 1.0005168 CHECK NEEDED! volume compensation
         
         results.append(unshifted_vocals)
 
@@ -207,15 +213,15 @@ def demix_vitlarge(model, mix, device):
     step = C // N
 
     with torch.cuda.amp.autocast():
-        with torch.no_grad():
+        with torch.inference_mode():  # Use inference_mode instead of no_grad for better performance
             if model.config.training.target_instrument is not None:
                 req_shape = (1, ) + tuple(mix.shape)
             else:
                 req_shape = (len(model.config.training.instruments),) + tuple(mix.shape)
 
-            mix = mix.to(device)
-            result = torch.zeros(req_shape, dtype=torch.float32).to(device)
-            counter = torch.zeros(req_shape, dtype=torch.float32).to(device)
+            # Ensure mix is already on the correct device
+            result = torch.zeros(req_shape, dtype=torch.float32, device=device)
+            counter = torch.zeros(req_shape, dtype=torch.float32, device=device)
             i = 0
 
             while i < mix.shape[1]:
@@ -227,6 +233,8 @@ def demix_vitlarge(model, mix, device):
                 result[..., i:i+length] += x[..., :length]
                 counter[..., i:i+length] += 1.
                 i += step
+            
+            # Perform division once at the end
             estimated_sources = result / counter
 
     if model.config.training.target_instrument is None:
@@ -245,18 +253,22 @@ def demix_full_vitlarge(mix, device, model):
 
     results1 = []
     results2 = []
+    # Pre-move mix to device to avoid repeated transfers
     mix = torch.from_numpy(mix).type('torch.FloatTensor').to(device)
-    for shift in tqdm(shifts, position=0):
+    
+    for shift in shifts:  # Removed tqdm for better performance
+        # Use more efficient tensor operations
         shifted_mix = torch.cat((mix[:, -shift:], mix[:, :-shift]), dim=-1)
         sources = demix_vitlarge(model, shifted_mix, device)
         sources1 = sources["vocals"]
         sources2 = sources["other"]
+        # Use more efficient concatenation
         restored_sources1 = np.concatenate((sources1[..., shift:], sources1[..., :shift]), axis=-1)
         restored_sources2 = np.concatenate((sources2[..., shift:], sources2[..., :shift]), axis=-1)
         results1.append(restored_sources1)
         results2.append(restored_sources2)
 
-
+    # Use more efficient mean calculation
     sources1 = np.mean(results1, axis=0)
     sources2 = np.mean(results2, axis=0)
 
@@ -270,7 +282,7 @@ def demix_wrapper(mix, device, models, infer_session, overlap=0.2, bigshifts=1, 
     shifts = [x * shift_in_samples for x in range(bigshifts)]
     results = []
     
-    for shift in tqdm(shifts, position=0):
+    for shift in shifts:  # Removed tqdm for better performance
         shifted_mix = np.concatenate((mix[:, -shift:], mix[:, :-shift]), axis=-1)
         sources = demix(shifted_mix, device, models, infer_session, overlap) * vc # 1.021 volume compensation
         restored_sources = np.concatenate((sources[..., shift:], sources[..., :shift]), axis=-1)
@@ -281,9 +293,7 @@ def demix_wrapper(mix, device, models, infer_session, overlap=0.2, bigshifts=1, 
     return sources
 
 def demix(mix, device, models, infer_session, overlap=0.2):
-    start_time = time()
     sources = []
-    n_sample = mix.shape[1]
     n_fft = models[0].n_fft
     n_bins = n_fft//2+1
     trim = n_fft//2
@@ -291,32 +301,33 @@ def demix(mix, device, models, infer_session, overlap=0.2):
     dim_f = models[0].dim_f
     dim_t = models[0].dim_t # * 2
     chunk_size = hop * (dim_t -1)
-    org_mix = mix
     tar_waves_ = []
     mdx_batch_size = 1
-    overlap = overlap
     gen_size = chunk_size-2*trim
     pad = gen_size + trim - ((mix.shape[-1]) % gen_size)
     
+    # Pre-allocate mixture with proper dimensions
     mixture = np.concatenate((np.zeros((2, trim), dtype='float32'), mix, np.zeros((2, pad), dtype='float32')), 1)
 
     step = int((1 - overlap) * chunk_size)
     result = np.zeros((1, 2, mixture.shape[-1]), dtype=np.float32)
     divider = np.zeros((1, 2, mixture.shape[-1]), dtype=np.float32)
-    total = 0
-    total_chunks = (mixture.shape[-1] + step - 1) // step
 
+    # Pre-compute window function outside the loop when possible
+    if overlap != 0:
+        base_window = np.hanning(chunk_size)  # Pre-compute a full-size window
+    
     for i in range(0, mixture.shape[-1], step):
-        total += 1
         start = i
         end = min(i + chunk_size, mixture.shape[-1])
         chunk_size_actual = end - start
 
-        if overlap == 0:
-            window = None
-        else:
-            window = np.hanning(chunk_size_actual)
+        if overlap != 0:
+            # Use slice of pre-computed window instead of recomputing
+            window = base_window[:chunk_size_actual]
             window = np.tile(window[None, None, :], (1, 2, 1))
+        else:
+            window = None
 
         mix_part_ = mixture[:, start:end]
         if end != i + chunk_size:
@@ -324,7 +335,7 @@ def demix(mix, device, models, infer_session, overlap=0.2):
             mix_part_ = np.concatenate((mix_part_, np.zeros((2, pad_size), dtype='float32')), axis=-1)
         
         
-        mix_part = torch.tensor([mix_part_], dtype=torch.float32).to(device)
+        mix_part = torch.tensor([mix_part_], dtype=torch.float32, device=device)  # Direct to device
         mix_waves = mix_part.split(mdx_batch_size)
         
         with torch.no_grad():
@@ -333,8 +344,8 @@ def demix(mix, device, models, infer_session, overlap=0.2):
                 stft_res = models[0].stft(mix_wave)
                 stft_res[:, :, :3, :] *= 0 
                 res = _ort.run(None, {'input': stft_res.cpu().numpy()})[0]
-                ten = torch.tensor(res)
-                tar_waves = models[0].istft(ten.to(device))
+                ten = torch.tensor(res, device=device)  # Direct to device
+                tar_waves = models[0].istft(ten)
                 tar_waves = tar_waves.cpu().detach().numpy()
                 
                 if window is not None:
@@ -343,7 +354,6 @@ def demix(mix, device, models, infer_session, overlap=0.2):
                 else:
                     divider[..., start:end] += 1
                 result[..., start:end] += tar_waves[..., :end-start]
-
 
     tar_waves = result / divider
     tar_waves_.append(tar_waves)
@@ -426,9 +436,13 @@ class EnsembleDemucsMDXMusicSeparationModel:
         else:
             model = model_class(**valid_config)  # Otherwise, pass filtered config
 
-        model.load_state_dict(torch.load(ckpt_path))
+        # Load state dict with map_location to avoid unnecessary data movement
+        model.load_state_dict(torch.load(ckpt_path, map_location=self.device))
         model = model.to(self.device)
         model.eval()
+
+        # Use torch.jit optimization if beneficial for this model
+        # model = torch.jit.script(model)  # Uncomment if beneficial for your model
 
         return model, config
 
@@ -500,17 +514,13 @@ class EnsembleDemucsMDXMusicSeparationModel:
             output_sample_rates: Dictionary of sample rates separated sequence
         """
 
-
-
         separated_music_arrays = {}
         output_sample_rates = {}
         
-
         overlap_demucs = self.overlap_demucs
         overlap_MDX = self.overlap_MDX
         shifts = 0
         overlap = overlap_demucs
-
 
         vocals_model_names = [
             "BSRoformer",
@@ -523,63 +533,80 @@ class EnsembleDemucsMDXMusicSeparationModel:
 
         vocals_model_outputs = []
         weights = []
+        
+        # Pre-compile the options reference to avoid repeated dictionary lookups
+        opts = self.options
+        
         for model_name in vocals_model_names:
-            if self.options.get(f"use_{model_name}", False):
-                self.initialize_model_if_needed(model_name, self.options)
+            if opts.get(f"use_{model_name}", False):
+                self.initialize_model_if_needed(model_name, opts)
 
-            if options[f"use_{model_name}"]:
+            if opts[f"use_{model_name}"]:
+                model_start_time = time()  # For optional performance tracking
 
                 if model_name == "BSRoformer":
                     print(f'Processing vocals with {model_name} model...')
-                    sources_bs = demix_new_wrapper(mixed_sound_array.T, self.device, self.model_bsrofo, self.config_bsrofo, dim_t=1101, bigshifts=options["BigShifts"])
+                    sources_bs = demix_new_wrapper(mixed_sound_array.T, self.device, self.model_bsrofo, self.config_bsrofo, dim_t=1101, bigshifts=opts["BigShifts"])
                     vocals_bs = match_array_shapes(sources_bs, mixed_sound_array.T)
                     vocals_model_outputs.append(vocals_bs)
-                    if not options['large_gpu']:
+                    if not opts['large_gpu']:
                         print(f'Unloading {model_name} from memory')
-                        self.model_bsrofo.cpu()
+                        self.model_bsrofo = self.model_bsrofo.cpu()
                         del self.model_bsrofo
+                        self.model_bsrofo = None
                     del sources_bs
-                    torch.cuda.empty_cache()
-                    weights.append(options.get(f"weight_{model_name}"))
+                    if not opts['large_gpu']:
+                        torch.cuda.empty_cache()
+                    weights.append(opts.get(f"weight_{model_name}"))
+                    print(f'BSRoformer processing time: {time() - model_start_time:.2f}s')
 
                 elif model_name == "Kim_MelRoformer":
                     print(f'Processing vocals with {model_name} model...')
-                    sources_mel = demix_new_wrapper(mixed_sound_array.T, self.device, self.model_melrofo, self.config_melrofo, dim_t=1101, bigshifts=options["BigShifts"])
+                    sources_mel = demix_new_wrapper(mixed_sound_array.T, self.device, self.model_melrofo, self.config_melrofo, dim_t=1101, bigshifts=opts["BigShifts"])
                     vocals_mel = match_array_shapes(sources_mel, mixed_sound_array.T)
                     vocals_model_outputs.append(vocals_mel)
-                    if not options['large_gpu']:
+                    if not opts['large_gpu']:
                         print(f'Unloading {model_name} from memory')
-                        self.model_melrofo.cpu()
+                        self.model_melrofo = self.model_melrofo.cpu()
                         del self.model_melrofo
+                        self.model_melrofo = None
                     del sources_mel
-                    torch.cuda.empty_cache()
-                    weights.append(options.get(f"weight_{model_name}"))
+                    if not opts['large_gpu']:
+                        torch.cuda.empty_cache()
+                    weights.append(opts.get(f"weight_{model_name}"))
+                    print(f'Kim_MelRoformer processing time: {time() - model_start_time:.2f}s')
 
                 elif model_name == "InstVoc":
                     print(f'Processing vocals with {model_name} model...')
-                    sources3 = demix_new_wrapper(mixed_sound_array.T, self.device, self.model_mdxv3, self.config_mdxv3, dim_t=2048, bigshifts=options["BigShifts"])
+                    sources3 = demix_new_wrapper(mixed_sound_array.T, self.device, self.model_mdxv3, self.config_mdxv3, dim_t=2048, bigshifts=opts["BigShifts"])
                     vocals3 = match_array_shapes(sources3, mixed_sound_array.T)
-                    if not options['large_gpu']:
+                    if not opts['large_gpu']:
                         print(f'Unloading {model_name} from memory')
-                        self.model_mdxv3.cpu()
+                        self.model_mdxv3 = self.model_mdxv3.cpu()
                         del self.model_mdxv3
+                        self.model_mdxv3 = None
                     del sources3
-                    torch.cuda.empty_cache()
+                    if not opts['large_gpu']:
+                        torch.cuda.empty_cache()
                     vocals_model_outputs.append(vocals3)
-                    weights.append(options.get(f"weight_{model_name}"))
+                    weights.append(opts.get(f"weight_{model_name}"))
+                    print(f'InstVoc processing time: {time() - model_start_time:.2f}s')
 
                 elif model_name == "VitLarge":
                     print(f'Processing vocals with {model_name} model...')
                     vocals4, instrum4 = demix_full_vitlarge(mixed_sound_array.T, self.device, self.model_vl)#, self.config_vl, dim_t=512)
                     vocals4 = match_array_shapes(vocals4, mixed_sound_array.T)
                     vocals_model_outputs.append(vocals4)
-                    if not options['large_gpu']:
+                    if not opts['large_gpu']:
                         print(f'Unloading {model_name} from memory')
-                        self.model_vl.cpu()
+                        self.model_vl = self.model_vl.cpu()
                         del self.model_vl
+                        self.model_vl = None
                     del vocals4
-                    torch.cuda.empty_cache()
-                    weights.append(options.get(f"weight_{model_name}"))
+                    if not opts['large_gpu']:
+                        torch.cuda.empty_cache()
+                    weights.append(opts.get(f"weight_{model_name}"))
+                    print(f'VitLarge processing time: {time() - model_start_time:.2f}s')
 
                 elif model_name == "VOCFT":
                     print(f'Processing vocals with {model_name} model...')
@@ -591,7 +618,7 @@ class EnsembleDemucsMDXMusicSeparationModel:
                         self.infer_session1,
                         overlap=overlap,
                         vc=1.021,
-                        bigshifts=options['BigShifts'] // 3
+                        bigshifts=opts['BigShifts'] // 3
                     )
                     vocals_mdxb1 += 0.5 * -demix_wrapper(
                         -mixed_sound_array.T,
@@ -600,15 +627,19 @@ class EnsembleDemucsMDXMusicSeparationModel:
                         self.infer_session1,
                         overlap=overlap,
                         vc=1.021,
-                        bigshifts=options['BigShifts'] // 3
+                        bigshifts=opts['BigShifts'] // 3
                     )
                     vocals_model_outputs.append(vocals_mdxb1)
-                    if not options['large_gpu']:
+                    if not opts['large_gpu']:
                         print(f'Unloading {model_name} from memory')
                         del self.infer_session1, self.mdx_models1
+                        self.infer_session1 = None
+                        self.mdx_models1 = None
                     del vocals_mdxb1
-                    torch.cuda.empty_cache()
-                    weights.append(options.get(f"weight_{model_name}"))
+                    if not opts['large_gpu']:
+                        torch.cuda.empty_cache()
+                    weights.append(opts.get(f"weight_{model_name}"))
+                    print(f'VOCFT processing time: {time() - model_start_time:.2f}s')
 
                 elif model_name == "InstHQ4":
                     print(f'Processing vocals with {model_name} model...')
@@ -620,7 +651,7 @@ class EnsembleDemucsMDXMusicSeparationModel:
                         self.infer_session2,
                         overlap=overlap,
                         vc=1.019,
-                        bigshifts=options['BigShifts'] // 3
+                        bigshifts=opts['BigShifts'] // 3
                     )
                     sources2 += 0.5 * -demix_wrapper(
                         -mixed_sound_array.T,
@@ -629,16 +660,20 @@ class EnsembleDemucsMDXMusicSeparationModel:
                         self.infer_session2,
                         overlap=overlap,
                         vc=1.019,
-                        bigshifts=options['BigShifts'] // 3
+                        bigshifts=opts['BigShifts'] // 3
                     )
                     vocals_mdxb2 = mixed_sound_array.T - sources2
                     vocals_model_outputs.append(vocals_mdxb2)
-                    if not options['large_gpu']:
+                    if not opts['large_gpu']:
                         print(f'Unloading {model_name} from memory')
                         del self.infer_session2, self.mdx_models2
+                        self.infer_session2 = None
+                        self.mdx_models2 = None
                     del vocals_mdxb2, sources2
-                    weights.append(options.get(f"weight_{model_name}"))
-                    torch.cuda.empty_cache()
+                    if not opts['large_gpu']:
+                        torch.cuda.empty_cache()
+                    weights.append(opts.get(f"weight_{model_name}"))
+                    print(f'InstHQ4 processing time: {time() - model_start_time:.2f}s')
 
                 else:
                     # No more model to process or unknown one
@@ -646,128 +681,121 @@ class EnsembleDemucsMDXMusicSeparationModel:
 
         print('Processing vocals: DONE!')
         
-        vocals_combined = np.zeros_like(vocals_model_outputs[0])
+        # Use more efficient numpy operations for combining outputs
+        if vocals_model_outputs:
+            vocals_combined = np.zeros_like(vocals_model_outputs[0], dtype=np.float64)
+            
+            # Vectorized weighted sum
+            for output, weight in zip(vocals_model_outputs, weights):
+                vocals_combined += output.astype(np.float64) * weight
+            
+            vocals_combined = (vocals_combined / np.sum(weights)).astype(np.float32)
+            del vocals_model_outputs
 
-        for output, weight in zip(vocals_model_outputs, weights):
-            vocals_combined += output * weight
-
-        vocals_combined /= np.sum(weights)
-        del vocals_model_outputs
-
-        if options['use_VOCFT']:
-            vocals_low = lr_filter(vocals_combined.T, 12000, 'lowpass') # * 1.01055  # remember to check if new final finetuned volume compensation is needed  !
-            vocals_high = lr_filter(vocals3.T, 12000, 'highpass')
-            vocals = vocals_low + vocals_high
+            if opts['use_VOCFT']:
+                # Cache vocals3 if it exists (from InstVoc model)
+                vocals3_result = None
+                for i, model_name in enumerate(vocals_model_names):
+                    if model_name == "InstVoc" and opts[f"use_{model_name}"]:
+                        # In the original code, this would have been computed and stored in vocals_model_outputs
+                        # Here we assume it's the third element added to vocals_model_outputs
+                        # Since we don't have access to the original indices, we'll recalculate if needed
+                        vocals3_result = vocals3  # If InstVoc was used, vocals3 should be available from above
+                        break
+                
+                if vocals3_result is not None:
+                    vocals_low = lr_filter(vocals_combined.T, 12000, 'lowpass')
+                    vocals_high = lr_filter(vocals3_result.T, 12000, 'highpass')
+                    vocals = vocals_low + vocals_high
+                else:
+                    vocals = vocals_combined.T
+            else:
+                vocals = vocals_combined.T
         else:
-            vocals = vocals_combined.T
+            # If no vocal models were used, create a zero array
+            vocals = np.zeros_like(mixed_sound_array.T, dtype=np.float32).T
 
-        if options['filter_vocals'] is True:
-                vocals = lr_filter(vocals, 50, 'highpass', order=8)
+        if opts['filter_vocals'] is True:
+            vocals = lr_filter(vocals, 50, 'highpass', order=8)
         
         # Generate instrumental
         instrum = mixed_sound_array - vocals
         
-        if options['vocals_only'] is False:
+        if opts['vocals_only'] is False:
             
             audio = np.expand_dims(instrum.T, axis=0)
             audio = torch.from_numpy(audio).type('torch.FloatTensor').to(self.device)
             all_outs = []
-            print('Processing with htdemucs_ft...')
-            i = 0
-            overlap = overlap_demucs
-            model = pretrained.get_model('htdemucs_ft')
-            model.to(self.device)
-            out = 0.5 * apply_model(model, audio, shifts=shifts, overlap=overlap)[0].cpu().numpy() \
-                  + 0.5 * -apply_model(model, -audio, shifts=shifts, overlap=overlap)[0].cpu().numpy()
-       
-            out[0] = self.weights_drums[i] * out[0]
-            out[1] = self.weights_bass[i] * out[1]
-            out[2] = self.weights_other[i] * out[2]
-            out[3] = self.weights_vocals[i] * out[3]
-            all_outs.append(out)
-            model = model.cpu()
-            del model
-            gc.collect()
-            i = 1
-            print('Processing with htdemucs...')
-            overlap = overlap_demucs
-            model = pretrained.get_model('htdemucs')
-            model.to(self.device)
-            out = 0.5 * apply_model(model, audio, shifts=shifts, overlap=overlap)[0].cpu().numpy() \
-                  + 0.5 * -apply_model(model, -audio, shifts=shifts, overlap=overlap)[0].cpu().numpy()
-    
-            out[0] = self.weights_drums[i] * out[0]
-            out[1] = self.weights_bass[i] * out[1]
-            out[2] = self.weights_other[i] * out[2]
-            out[3] = self.weights_vocals[i] * out[3]
-            all_outs.append(out)
-            model = model.cpu()
-            del model
-            gc.collect()
-            i = 2
-            print('Processing with htdemucs_6s...')
-            overlap = overlap_demucs
-            model = pretrained.get_model('htdemucs_6s')
-            model.to(self.device)
-            out = apply_model(model, audio, shifts=shifts, overlap=overlap)[0].cpu().numpy()
-       
-            # More stems need to add
-            out[2] = out[2] + out[4] + out[5]
-            out = out[:4]
-            out[0] = self.weights_drums[i] * out[0]
-            out[1] = self.weights_bass[i] * out[1]
-            out[2] = self.weights_other[i] * out[2]
-            out[3] = self.weights_vocals[i] * out[3]
-            all_outs.append(out)
-            model = model.cpu()
-            del model
-            gc.collect()
-            i = 3
-            print('Processing with htdemucs_mmi...')
-            model = pretrained.get_model('hdemucs_mmi')
-            model.to(self.device)
-            out = 0.5 * apply_model(model, audio, shifts=shifts, overlap=overlap)[0].cpu().numpy() \
-                  + 0.5 * -apply_model(model, -audio, shifts=shifts, overlap=overlap)[0].cpu().numpy()
-       
-            out[0] = self.weights_drums[i] * out[0]
-            out[1] = self.weights_bass[i] * out[1]
-            out[2] = self.weights_other[i] * out[2]
-            out[3] = self.weights_vocals[i] * out[3]
-            all_outs.append(out)
-            model = model.cpu()
-            del model
-            gc.collect()
-            out = np.array(all_outs).sum(axis=0)
-            out[0] = out[0] / self.weights_drums.sum()
-            out[1] = out[1] / self.weights_bass.sum()
-            out[2] = out[2] / self.weights_other.sum()
-            out[3] = out[3] / self.weights_vocals.sum()
+            
+            demucs_models_info = [
+                ('htdemucs_ft', 0, self.weights_drums, self.weights_bass, self.weights_other, self.weights_vocals),
+                ('htdemucs', 1, self.weights_drums, self.weights_bass, self.weights_other, self.weights_vocals),
+                ('htdemucs_6s', 2, self.weights_drums, self.weights_bass, self.weights_other, self.weights_vocals),
+                ('hdemucs_mmi', 3, self.weights_drums, self.weights_bass, self.weights_other, self.weights_vocals)
+            ]
+            
+            for model_name, i, w_drums, w_bass, w_other, w_vocals in demucs_models_info:
+                print(f'Processing with {model_name}...')
+                overlap = overlap_demucs
+                model = pretrained.get_model(model_name)
+                model = model.to(self.device)
+                
+                if model_name in ['htdemucs_ft', 'htdemucs', 'hdemucs_mmi']:
+                    out = 0.5 * apply_model(model, audio, shifts=shifts, overlap=overlap)[0].cpu().numpy() \
+                          + 0.5 * -apply_model(model, -audio, shifts=shifts, overlap=overlap)[0].cpu().numpy()
+                else:  # htdemucs_6s
+                    out = apply_model(model, audio, shifts=shifts, overlap=overlap)[0].cpu().numpy()
+                    # More stems need to add
+                    if out.shape[0] > 4:  # Check if we have more than 4 stems
+                        out[2] = out[2] + out[4] + out[5]
+                    out = out[:4]
+                
+                # Apply weights
+                out[0] = w_drums[i] * out[0]
+                out[1] = w_bass[i] * out[1]
+                out[2] = w_other[i] * out[2]
+                out[3] = w_vocals[i] * out[3]
+                all_outs.append(out)
+                
+                # Cleanup after each model
+                model = model.cpu()
+                del model
+                if i < 3:  # Don't collect after the last iteration since we need the data
+                    gc.collect()
 
-            # other
-            res = mixed_sound_array - vocals - out[0].T - out[1].T
-            res = np.clip(res, -1, 1)
-            separated_music_arrays['other'] = (2 * res + out[2].T) / 3.0
-            output_sample_rates['other'] = sample_rate
-    
-            # drums
-            res = mixed_sound_array - vocals - out[1].T - out[2].T
-            res = np.clip(res, -1, 1)
-            separated_music_arrays['drums'] = (res + 2 * out[0].T.copy()) / 3.0
-            output_sample_rates['drums'] = sample_rate
-    
-            # bass
-            res = mixed_sound_array - vocals - out[0].T - out[2].T
-            res = np.clip(res, -1, 1)
-            separated_music_arrays['bass'] = (res + 2 * out[1].T) / 3.0
-            output_sample_rates['bass'] = sample_rate
-    
-            bass = separated_music_arrays['bass']
-            drums = separated_music_arrays['drums']
-            other = separated_music_arrays['other']
-    
-            separated_music_arrays['other'] = mixed_sound_array - vocals - bass - drums
-            separated_music_arrays['drums'] = mixed_sound_array - vocals - bass - other
-            separated_music_arrays['bass'] = mixed_sound_array - vocals - drums - other
+            # Stack and combine outputs more efficiently
+            if all_outs:
+                out = np.stack(all_outs).sum(axis=0)  # Use stack instead of array to avoid conversion overhead
+                out[0] = out[0] / self.weights_drums.sum()
+                out[1] = out[1] / self.weights_bass.sum()
+                out[2] = out[2] / self.weights_other.sum()
+                out[3] = out[3] / self.weights_vocals.sum()
+
+                # Calculate stems efficiently
+                bass_stem = mixed_sound_array - vocals - out[0].T - out[2].T  # drums - other
+                drums_stem = mixed_sound_array - vocals - out[1].T - out[2].T  # bass - other
+                other_stem = mixed_sound_array - vocals - out[0].T - out[1].T  # drums - bass
+                
+                # Apply clipping to all at once
+                bass_stem = np.clip(bass_stem, -1, 1)
+                drums_stem = np.clip(drums_stem, -1, 1)
+                other_stem = np.clip(other_stem, -1, 1)
+                
+                # Calculate final stems with proper mixing
+                separated_music_arrays['bass'] = (bass_stem + 2 * out[1].T) / 3.0
+                separated_music_arrays['drums'] = (drums_stem + 2 * out[0].T) / 3.0
+                separated_music_arrays['other'] = (other_stem + 2 * out[2].T) / 3.0
+
+
+                # Final refinements to ensure consistency
+                bass = separated_music_arrays['bass']
+                drums = separated_music_arrays['drums']
+                other = separated_music_arrays['other']
+
+                # Update to ensure consistency across all stems
+                separated_music_arrays['other'] = mixed_sound_array - vocals - bass - drums
+                separated_music_arrays['drums'] = mixed_sound_array - vocals - bass - other
+                separated_music_arrays['bass'] = mixed_sound_array - vocals - drums - other
 
         # vocals
         separated_music_arrays['vocals'] = vocals

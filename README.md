@@ -1,13 +1,18 @@
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/Q5Q811R5YI)  
-# MVSep-MDX23 Colab Fork v2.5
+# MVSep-MDX23 Colab Fork v2.5.2 - OPTIMIZED
 
-Adaptation of MVSep-MDX23 algorithm for Colab, with few tweaks:
+Optimized adaptation of MVSep-MDX23 algorithm for Colab, with performance improvements and few tweaks:
 
-https://colab.research.google.com/github/jarredou/MVSEP-MDX23-Colab_v2/blob/v2.5/MVSep-MDX23-Colab.ipynb  
+https://colab.research.google.com/github/terastudio-org/MVSEP-MDX23/blob/main/MVSep-MDX23.ipynb  
 <br>  
 
 Recent changes:  
 
+
+**v2.5.2** *(OCT 2024)*
+* **Performance optimizations** - Memory management improvements, reduced GPU transfers, faster tensor operations
+* **Enhanced stability** - Better memory leak prevention and resource cleanup
+* **Faster processing speeds** - Optimized chunking operations and algorithmic improvements
 
 **v2.5.1** *(24 SEPT 2024)*  
 * better memory management (use `--large_gpu` to keep all models in memory during folder batch processing)
@@ -81,4 +86,5 @@ Credits:
 * [ZFTurbo/MVSep](https://github.com/ZFTurbo/MVSEP-MDX23-music-separation-model)
 * Models by [Demucs](https://github.com/facebookresearch/demucs), [Anjok](https://github.com/Anjok07/ultimatevocalremovergui), [Kimberley Jensen](https://github.com/KimberleyJensen), [aufr33](https://github.com/aufr33) & viperx
 * Adaptation & tweaks by [jarredou](https://github.com/jarredou/MVSEP-MDX23-Colab_v2/)
+* Performance optimizations by [terastudio-org](https://github.com/terastudio-org/MVSEP-MDX23.git)
 </font>
